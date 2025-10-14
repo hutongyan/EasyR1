@@ -222,6 +222,10 @@ class DataParallelPPOActor(BasePPOActor):
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid slient error
         select_keys = ["input_ids", "attention_mask", "position_ids", "responses", "response_mask"]
         select_keys.extend(["old_log_probs", "ref_log_probs", "advantages"])
+        if "behavior_log_probs" in data.batch:
+            select_keys.append("behavior_log_probs")
+        if "importance_weights" in data.batch:
+            select_keys.append("importance_weights")
         non_tensor_select_keys = ["multi_modal_inputs"]
 
         # Split to make minibatch iterator for updating the actor
@@ -252,6 +256,8 @@ class DataParallelPPOActor(BasePPOActor):
                     response_mask = model_inputs["response_mask"]
                     old_log_probs = model_inputs["old_log_probs"]
                     advantages = model_inputs["advantages"]
+                    behavior_log_probs = model_inputs.get("behavior_log_probs")
+                    importance_weights = model_inputs.get("importance_weights")
 
                     # all return: (bsz, response_length)
                     log_probs = self._forward_micro_batch(model_inputs, temperature=temperature)
@@ -265,6 +271,8 @@ class DataParallelPPOActor(BasePPOActor):
                         clip_ratio_high=self.config.clip_ratio_high,
                         clip_ratio_dual=self.config.clip_ratio_dual,
                         loss_avg_mode=self.config.loss_avg_mode,
+                        behavior_log_probs=behavior_log_probs,
+                        importance_weights=importance_weights,
                     )
                     if self.config.use_kl_loss and "ref_log_probs" in model_inputs:
                         ref_log_probs = model_inputs["ref_log_probs"]

@@ -13,8 +13,8 @@
 # limitations under the License.
 
 
-from .config import RolloutConfig
+from .config import OffPolicyGuidanceConfig, RolloutConfig
 from .vllm_rollout_spmd import vLLMRollout
 
 
-__all__ = ["RolloutConfig", "vLLMRollout"]
+__all__ = ["OffPolicyGuidanceConfig", "RolloutConfig", "vLLMRollout"]

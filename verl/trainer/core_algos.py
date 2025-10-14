@@ -21,7 +21,7 @@ implement PPO
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, Optional
 
 import numpy as np
 import torch
@@ -362,6 +362,8 @@ def compute_policy_loss(
     clip_ratio_high: float,
     clip_ratio_dual: float,
     loss_avg_mode: Literal["token", "seq"],
+    behavior_log_probs: Optional[torch.Tensor] = None,
+    importance_weights: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Compute the clipped policy objective and related metrics for PPO.
 
@@ -386,6 +388,11 @@ def compute_policy_loss(
             "token": average the loss in the whole batch
             "seq": average the loss in each sequence then average the mean of the means
 
+        behavior_log_probs: `(torch.Tensor, optional)`
+            shape: (bs, response_length). When provided, ratios are computed w.r.t. the behaviour policy.
+        importance_weights: `(torch.Tensor, optional)`
+            shape: (bs, response_length). Importance sampling weights multiplying the advantages.
+
     Returns:
         pg_loss: `a scalar torch.Tensor`
             policy gradient loss computed via PPO
@@ -399,7 +406,8 @@ def compute_policy_loss(
             a float number indicating the mean entropy loss
 
     """
-    negative_approx_kl = log_probs - old_log_probs
+    ratio_source = behavior_log_probs if behavior_log_probs is not None else old_log_probs
+    negative_approx_kl = log_probs - ratio_source
     # clamp negative_approx_kl to avoid nan kld
     negative_approx_kl = torch.clamp(negative_approx_kl, -20.0, 20.0)
     ratio = torch.exp(negative_approx_kl)
@@ -410,7 +418,14 @@ def compute_policy_loss(
     )
 
     # pg metrics
-    metrics = {"ppo_kl": -negative_approx_kl}
+    if importance_weights is not None:
+        advantages = advantages * importance_weights
+
+    metrics = {
+        "ppo_kl": (old_log_probs - log_probs) if behavior_log_probs is not None else -negative_approx_kl
+    }
+    if behavior_log_probs is not None:
+        metrics["ppo_behavior_kl"] = ratio_source - log_probs
     # use negative log probs as an estimator of entropy loss
     metrics["entropy_loss"] = average_loss(-log_probs, response_mask, mode=loss_avg_mode)
 

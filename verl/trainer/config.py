@@ -101,6 +101,12 @@ class AlgorithmConfig:
     """filter out low reward samples if online filtering"""
     filter_high: float = 0.99
     """filter out high reward samples if online filtering"""
+    importance_clamp_min: float = 0.0
+    """lower clamp for importance sampling weights (0 disables)"""
+    importance_clamp_max: float = 10.0
+    """upper clamp for importance sampling weights (<=0 disables)"""
+    importance_detach: bool = False
+    """stop gradients through importance weights when enabled"""
 
 
 @dataclass

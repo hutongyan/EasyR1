@@ -28,7 +28,7 @@ from ...utils import torch_functional as VF
 from ...utils.dataset import process_image, process_video
 from ...utils.torch_dtypes import PrecisionType
 from .base import BaseRollout
-from .config import RolloutConfig
+from .config import OffPolicyGuidanceConfig, RolloutConfig
 
 
 def _repeat_interleave(value: Union[torch.Tensor, np.ndarray], repeats: int) -> Union[torch.Tensor, np.ndarray]:
@@ -69,6 +69,82 @@ def _process_multi_modal_data(
         return {"video": videos}
 
     return None
+
+
+def _resolve_logprob_entry(entry: Any, token_id: int) -> float:
+    if entry is None:
+        return float("nan")
+
+    # vLLM may return a dict mapping token ids/strings to floats
+    if isinstance(entry, dict):
+        value = entry.get(token_id)
+        if value is None:
+            value = entry.get(str(token_id))
+        if value is None and hasattr(entry, "items"):
+            for key, candidate in entry.items():
+                if hasattr(candidate, "token_id") and candidate.token_id == token_id:
+                    value = candidate
+                    break
+        if hasattr(value, "logprob"):
+            return float(value.logprob)
+        if value is not None:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                pass
+
+    # some versions return an iterable of candidates
+    try:
+        iterator = iter(entry)
+    except TypeError:
+        return float("nan")
+
+    for candidate in iterator:
+        cand_token = getattr(candidate, "token_id", getattr(candidate, "id", None))
+        if cand_token is None and isinstance(candidate, tuple) and len(candidate) >= 2:
+            cand_token = candidate[0]
+            candidate_value = candidate[1]
+        else:
+            candidate_value = getattr(candidate, "logprob", None)
+
+        if cand_token == token_id or str(cand_token) == str(token_id):
+            if candidate_value is None and isinstance(candidate, tuple) and len(candidate) >= 2:
+                candidate_value = candidate[1]
+
+            if candidate_value is not None:
+                try:
+                    return float(candidate_value)
+                except (TypeError, ValueError):
+                    return float("nan")
+
+    return float("nan")
+
+
+def _extract_sequence_logprobs(sequence_output: Any) -> list[float]:
+    # sequence_output.logprobs is a per-token structure.
+    logprob_entries = getattr(sequence_output, "logprobs", None)
+    token_ids = getattr(sequence_output, "token_ids", [])
+    if logprob_entries is None:
+        return [float("nan")] * len(token_ids)
+
+    chosen = []
+    for token_id, entry in zip(token_ids, logprob_entries):
+        chosen.append(_resolve_logprob_entry(entry, token_id))
+
+    return chosen
+
+
+def _merge_guidance_outputs(draft_output: Any, guidance_output: Any) -> tuple[list[int], list[int], list[float]]:
+    guidance_tokens = getattr(guidance_output, "token_ids", [])
+    draft_tokens = getattr(draft_output, "token_ids", [])
+
+    offpolicy_mask = []
+    for idx, token_id in enumerate(guidance_tokens):
+        is_offpolicy = idx >= len(draft_tokens) or draft_tokens[idx] != token_id
+        offpolicy_mask.append(1 if is_offpolicy else 0)
+
+    guidance_logprobs = _extract_sequence_logprobs(guidance_output)
+    return guidance_tokens, offpolicy_mask, guidance_logprobs
 
 
 class vLLMRollout(BaseRollout):
@@ -135,25 +211,85 @@ class vLLMRollout(BaseRollout):
         for key in config.to_dict().keys():
             if hasattr(default_sampling_params, key):
                 sampling_kwargs[key] = getattr(config, key)
-
         print(f"Sampling params: {sampling_kwargs}.")
         self.sampling_params = SamplingParams(**sampling_kwargs)
+
+        self.guidance_config: Optional[OffPolicyGuidanceConfig] = (
+            config.offpolicy_guidance if config.offpolicy_guidance and config.offpolicy_guidance.is_enabled() else None
+        )
+        self.guidance_engine: Optional[LLM] = None
+        self.guidance_sampling_params: Optional[SamplingParams] = None
+
+        if self.guidance_config is not None:
+            guidance_engine_kwargs = {}
+            if processor is not None:
+                guidance_engine_kwargs["disable_mm_preprocessor_cache"] = True
+                if config.limit_images:
+                    guidance_engine_kwargs["limit_mm_per_prompt"] = {"image": config.limit_images}
+
+            guidance_tp = self.guidance_config.tensor_parallel_size or config.tensor_parallel_size
+            guidance_gpu_mem = self.guidance_config.gpu_memory_utilization or config.gpu_memory_utilization
+            guidance_max_model_len = self.guidance_config.max_model_len or (
+                config.max_model_len or config.prompt_length + config.response_length
+            )
+            guidance_max_batched_tokens = (
+                self.guidance_config.max_num_batched_tokens or config.max_num_batched_tokens
+            )
+
+            guidance_dtype = self.guidance_config.dtype or config.dtype
+            self.guidance_engine = LLM(
+                model=self.guidance_config.model_path,
+                skip_tokenizer_init=False,
+                trust_remote_code=config.trust_remote_code,
+                load_format="dummy",
+                dtype=PrecisionType.to_str(PrecisionType.to_dtype(guidance_dtype)),
+                seed=config.seed,
+                max_model_len=guidance_max_model_len,
+                distributed_executor_backend="external_launcher",
+                tensor_parallel_size=guidance_tp,
+                gpu_memory_utilization=guidance_gpu_mem,
+                max_num_batched_tokens=guidance_max_batched_tokens,
+                disable_log_stats=config.disable_log_stats,
+                enforce_eager=config.enforce_eager,
+                disable_custom_all_reduce=True,
+                enable_chunked_prefill=config.enable_chunked_prefill,
+                enable_sleep_mode=True,
+                **guidance_engine_kwargs,
+            )
+
+            self.guidance_engine.sleep(level=1)
+
+            guidance_sampling_kwargs = dict(sampling_kwargs)
+            requested_logprobs = self.guidance_config.logprobs if self.guidance_config.logprobs is not None else 0
+            guidance_sampling_kwargs["logprobs"] = max(1, requested_logprobs)
+            if self.guidance_config.sampling_overrides:
+                guidance_sampling_kwargs.update(self.guidance_config.sampling_overrides)
+
+            print(f"Guidance sampling params: {guidance_sampling_kwargs}.")
+            self.guidance_sampling_params = SamplingParams(**guidance_sampling_kwargs)
 
     @contextmanager
     def update_sampling_params(self, **kwargs):
         # update sampling params
         old_sampling_params_args = {}
+        old_guidance_params_args = {}
         if kwargs:
             for key, value in kwargs.items():
                 if hasattr(self.sampling_params, key):
                     old_value = getattr(self.sampling_params, key)
                     old_sampling_params_args[key] = old_value
                     setattr(self.sampling_params, key, value)
+                if self.guidance_sampling_params is not None and hasattr(self.guidance_sampling_params, key):
+                    old_value = getattr(self.guidance_sampling_params, key)
+                    old_guidance_params_args[key] = old_value
+                    setattr(self.guidance_sampling_params, key, value)
 
         yield
         # roll back to previous sampling params
         for key, value in old_sampling_params_args.items():
             setattr(self.sampling_params, key, value)
+        for key, value in old_guidance_params_args.items():
+            setattr(self.guidance_sampling_params, key, value)
 
     @torch.no_grad()
     def generate_sequences(self, prompts: DataProto) -> DataProto:
@@ -192,10 +328,46 @@ class vLLMRollout(BaseRollout):
             completions: list[RequestOutput] = self.inference_engine.generate(
                 prompts=vllm_inputs, sampling_params=self.sampling_params, use_tqdm=self.use_tqdm
             )
-            response_ids = [output.token_ids for completion in completions for output in completion.outputs]
-            response_ids = VF.pad_2d_list_to_length(
-                response_ids, self.pad_token_id, max_length=self.config.response_length
-            ).to(input_ids.device)
+            draft_outputs = [output for completion in completions for output in completion.outputs]
+
+            if self.guidance_engine is not None and self.guidance_sampling_params is not None:
+                guidance_completions: list[RequestOutput] = self.guidance_engine.generate(
+                    prompts=vllm_inputs,
+                    sampling_params=self.guidance_sampling_params,
+                    use_tqdm=False,
+                )
+                guidance_outputs = [output for completion in guidance_completions for output in completion.outputs]
+                if len(guidance_outputs) != len(draft_outputs):
+                    raise RuntimeError(
+                        "Guidance model returned a different number of sequences compared to the actor rollout."
+                    )
+
+                response_list, offpolicy_masks, guidance_logprob_list = [], [], []
+                for draft_output, guidance_output in zip(draft_outputs, guidance_outputs):
+                    guidance_tokens, offpolicy_mask, guidance_logprobs = _merge_guidance_outputs(
+                        draft_output, guidance_output
+                    )
+                    response_list.append(guidance_tokens)
+                    offpolicy_masks.append(offpolicy_mask)
+                    guidance_logprob_list.append(guidance_logprobs)
+
+                response_ids = VF.pad_2d_list_to_length(
+                    response_list, self.pad_token_id, max_length=self.config.response_length
+                ).to(input_ids.device)
+                offpolicy_mask_tensor = VF.pad_2d_list_to_length(
+                    offpolicy_masks, 0, max_length=self.config.response_length
+                ).to(input_ids.device)
+                guidance_logprob_tensor = VF.pad_2d_list_to_length(
+                    guidance_logprob_list, 0.0, max_length=self.config.response_length
+                ).to(input_ids.device)
+                guidance_logprob_tensor = guidance_logprob_tensor.to(dtype=torch.float32)
+            else:
+                response_list = [output.token_ids for output in draft_outputs]
+                response_ids = VF.pad_2d_list_to_length(
+                    response_list, self.pad_token_id, max_length=self.config.response_length
+                ).to(input_ids.device)
+                offpolicy_mask_tensor = None
+                guidance_logprob_tensor = None
 
             if self.sampling_params.n > 1:
                 batch_size = batch_size * self.sampling_params.n
@@ -204,6 +376,12 @@ class vLLMRollout(BaseRollout):
                 position_ids = _repeat_interleave(position_ids, self.sampling_params.n)
                 if batch_multi_modal_data is not None:
                     batch_multi_modal_data = _repeat_interleave(batch_multi_modal_data, self.sampling_params.n)
+                if offpolicy_mask_tensor is not None:
+                    offpolicy_mask_tensor = _repeat_interleave(offpolicy_mask_tensor, self.sampling_params.n)
+                    guidance_logprob_tensor = _repeat_interleave(guidance_logprob_tensor, self.sampling_params.n)
+
+        if offpolicy_mask_tensor is not None:
+            offpolicy_mask_tensor = offpolicy_mask_tensor.to(dtype=torch.bool)
 
         sequence_ids = torch.cat([input_ids, response_ids], dim=-1)
         response_length = response_ids.size(1)
@@ -234,6 +412,9 @@ class vLLMRollout(BaseRollout):
             },
             batch_size=batch_size,
         )
+        if offpolicy_mask_tensor is not None:
+            batch["offpolicy_mask"] = offpolicy_mask_tensor
+            batch["guidance_log_probs"] = guidance_logprob_tensor
         if batch_multi_modal_data is not None:
             non_tensor_batch = {"multi_modal_data": batch_multi_modal_data}
         else:

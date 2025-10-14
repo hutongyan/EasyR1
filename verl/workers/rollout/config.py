@@ -20,6 +20,22 @@ from typing import Any, Optional
 
 
 @dataclass
+class OffPolicyGuidanceConfig:
+    enable: bool = False
+    model_path: Optional[str] = None
+    dtype: str = "bf16"
+    tensor_parallel_size: Optional[int] = None
+    gpu_memory_utilization: Optional[float] = None
+    max_model_len: Optional[int] = None
+    max_num_batched_tokens: Optional[int] = None
+    logprobs: int = 1
+    sampling_overrides: dict[str, Any] = field(default_factory=dict)
+
+    def is_enabled(self) -> bool:
+        return self.enable and self.model_path is not None
+
+
+@dataclass
 class RolloutConfig:
     name: str = "vllm"
     n: int = 1
@@ -39,6 +55,7 @@ class RolloutConfig:
     disable_log_stats: bool = True
     disable_tqdm: bool = False
     val_override_config: dict[str, Any] = field(default_factory=dict)
+    offpolicy_guidance: Optional[OffPolicyGuidanceConfig] = None
     # below are auto keys
     prompt_length: int = field(default=-1, init=False)
     response_length: int = field(default=-1, init=False)

@@ -463,6 +463,49 @@ class RayPPOTrainer:
         )
         metrics.update(global_balance_stats)
 
+    def _apply_offpolicy_guidance_metadata(self, batch: DataProto, metrics: dict[str, Any]) -> None:
+        if "offpolicy_mask" not in batch.batch or "guidance_log_probs" not in batch.batch:
+            return
+
+        offpolicy_mask = batch.batch["offpolicy_mask"].to(torch.bool)
+        response_mask = batch.batch["response_mask"].to(dtype=torch.bool)
+        old_log_probs = batch.batch["old_log_probs"]
+        raw_guidance_log_probs = batch.batch["guidance_log_probs"].to(dtype=old_log_probs.dtype)
+        nan_mask = torch.isnan(raw_guidance_log_probs)
+        guidance_log_probs = torch.where(nan_mask, old_log_probs, raw_guidance_log_probs)
+
+        behavior_log_probs = torch.where(offpolicy_mask, guidance_log_probs, old_log_probs)
+        importance_weights = torch.exp(old_log_probs - behavior_log_probs)
+
+        clamp_min = self.config.algorithm.importance_clamp_min
+        clamp_max = self.config.algorithm.importance_clamp_max
+        if clamp_min > 0.0:
+            importance_weights = torch.clamp(importance_weights, min=clamp_min)
+        if clamp_max > 0.0:
+            importance_weights = torch.clamp(importance_weights, max=clamp_max)
+        if self.config.algorithm.importance_detach:
+            importance_weights = importance_weights.detach()
+
+        batch.batch["behavior_log_probs"] = behavior_log_probs
+        batch.batch["importance_weights"] = importance_weights
+
+        masked_offpolicy = offpolicy_mask & response_mask
+        total_valid_tokens = torch.clamp(response_mask.sum(), min=1)
+        offpolicy_token_ratio = masked_offpolicy.sum().float() / total_valid_tokens.float()
+        metrics["guidance/offpolicy_token_ratio"] = offpolicy_token_ratio.item()
+
+        if nan_mask.any():
+            nan_ratio = (nan_mask & response_mask).sum().float() / total_valid_tokens.float()
+            metrics["guidance/logprob_nan_ratio"] = nan_ratio.item()
+
+        offpolicy_sequence_ratio = masked_offpolicy.any(dim=-1).float().mean().item()
+        metrics["guidance/offpolicy_sequence_ratio"] = offpolicy_sequence_ratio
+
+        metrics["guidance/importance_mean"] = VF.masked_mean(importance_weights, response_mask).item()
+        metrics["guidance/importance_max"] = (
+            (importance_weights * response_mask).amax().detach().item()
+        )
+
     def _make_batch_data(self, metrics: dict[str, Any]) -> DataProto:
         batch = None
         all_metrics = defaultdict(list)
@@ -610,6 +653,8 @@ class RayPPOTrainer:
                 with timer("old", timing_raw):
                     old_log_probs = self.actor_rollout_ref_wg.compute_log_probs(batch)
                     batch = batch.union(old_log_probs)
+
+                self._apply_offpolicy_guidance_metadata(batch, metrics)
 
                 # compute ref_log_probs
                 if self.use_reference_policy:
