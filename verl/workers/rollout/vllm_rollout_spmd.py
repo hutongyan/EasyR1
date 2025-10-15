@@ -329,32 +329,34 @@ class vLLMRollout(BaseRollout):
             completions: list[RequestOutput] = self.inference_engine.generate(
                 prompts=vllm_inputs, sampling_params=self.sampling_params, use_tqdm=self.use_tqdm
             )
-            draft_outputs = [output for completion in completions for output in completion.outputs]
 
+            draft_outputs: list = []
+            guidance_outputs: list | None = None
             if self.guidance_engine is not None and self.guidance_sampling_params is not None:
                 guidance_completions: list[RequestOutput] = self.guidance_engine.generate(
                     prompts=vllm_inputs,
                     sampling_params=self.guidance_sampling_params,
                     use_tqdm=False,
                 )
-                guidance_outputs = [output for completion in guidance_completions for output in completion.outputs]
-                guidance_samplings = getattr(self.guidance_sampling_params, "n", 1)
-                if guidance_samplings > 1:
-                    if len(guidance_outputs) % guidance_samplings != 0:
-                        raise RuntimeError(
-                            "Guidance model returned an unexpected number of sequences "
-                            f"({len(guidance_outputs)}) for n={guidance_samplings}."
-                        )
-                    guidance_outputs = [
-                        guidance_outputs[idx]
-                        for idx in range(0, len(guidance_outputs), guidance_samplings)
-                    ]
-
-                if len(guidance_outputs) != len(draft_outputs):
+                if len(guidance_completions) != len(completions):
                     raise RuntimeError(
-                        "Guidance model returned a different number of sequences compared to the actor rollout."
+                        "Guidance model returned a different number of completion groups compared to the actor rollout."
                     )
+                guidance_outputs = []
 
+            for draft_completion_idx, draft_completion in enumerate(completions):
+                draft_group = draft_completion.outputs
+                draft_outputs.extend(draft_group)
+
+                if guidance_outputs is not None:
+                    guidance_group = guidance_completions[draft_completion_idx].outputs
+                    if len(guidance_group) != len(draft_group):
+                        raise RuntimeError(
+                            "Guidance model returned a different number of sequences per prompt compared to the actor rollout."
+                        )
+                    guidance_outputs.extend(guidance_group)
+
+            if guidance_outputs is not None:
                 response_list, offpolicy_masks, guidance_logprob_list = [], [], []
                 for draft_output, guidance_output in zip(draft_outputs, guidance_outputs):
                     guidance_tokens, offpolicy_mask, guidance_logprobs = _merge_guidance_outputs(
@@ -363,12 +365,6 @@ class vLLMRollout(BaseRollout):
                     response_list.append(guidance_tokens)
                     offpolicy_masks.append(offpolicy_mask)
                     guidance_logprob_list.append(guidance_logprobs)
-
-                expected = len(draft_outputs)
-                if len(response_list) != expected:
-                    raise RuntimeError(
-                        f"Guidance model returned {len(response_list)} sequences for a batch of {expected}."
-                    )
 
                 response_ids = VF.pad_2d_list_to_length(
                     response_list, self.pad_token_id, max_length=self.config.response_length
