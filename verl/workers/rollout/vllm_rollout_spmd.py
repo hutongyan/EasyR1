@@ -352,7 +352,7 @@ class vLLMRollout(BaseRollout):
                     offpolicy_masks.append(offpolicy_mask)
                     guidance_logprob_list.append(guidance_logprobs)
 
-                expected = input_ids.size(0)
+                expected = len(draft_outputs)
                 if len(response_list) != expected:
                     raise RuntimeError(
                         f"Guidance model returned {len(response_list)} sequences for a batch of {expected}."
@@ -376,22 +376,19 @@ class vLLMRollout(BaseRollout):
                 offpolicy_mask_tensor = None
                 guidance_logprob_tensor = None
 
-            if self.sampling_params.n > 1:
-                batch_size = batch_size * self.sampling_params.n
-                input_ids = _repeat_interleave(input_ids, self.sampling_params.n)
-                attention_mask = _repeat_interleave(attention_mask, self.sampling_params.n)
-                position_ids = _repeat_interleave(position_ids, self.sampling_params.n)
-                if batch_multi_modal_data is not None:
-                    batch_multi_modal_data = _repeat_interleave(batch_multi_modal_data, self.sampling_params.n)
-                if offpolicy_mask_tensor is not None:
-                    offpolicy_mask_tensor = _repeat_interleave(offpolicy_mask_tensor, self.sampling_params.n)
-                    guidance_logprob_tensor = _repeat_interleave(guidance_logprob_tensor, self.sampling_params.n)
+        if self.sampling_params.n > 1:
+            new_batch_size = batch_size * self.sampling_params.n
+            batch_size = new_batch_size
+            input_ids = _repeat_interleave(input_ids, self.sampling_params.n)
+            attention_mask = _repeat_interleave(attention_mask, self.sampling_params.n)
+            position_ids = _repeat_interleave(position_ids, self.sampling_params.n)
+            if batch_multi_modal_data is not None:
+                batch_multi_modal_data = _repeat_interleave(batch_multi_modal_data, self.sampling_params.n)
+            if offpolicy_mask_tensor is not None and offpolicy_mask_tensor.size(0) != new_batch_size:
+                offpolicy_mask_tensor = _repeat_interleave(offpolicy_mask_tensor, self.sampling_params.n)
+                guidance_logprob_tensor = _repeat_interleave(guidance_logprob_tensor, self.sampling_params.n)
 
         if offpolicy_mask_tensor is not None:
-            if offpolicy_mask_tensor.size(0) != batch_size:
-                repeat = batch_size // offpolicy_mask_tensor.size(0)
-                offpolicy_mask_tensor = offpolicy_mask_tensor.repeat_interleave(repeat, dim=0)
-                guidance_logprob_tensor = guidance_logprob_tensor.repeat_interleave(repeat, dim=0)
             offpolicy_mask_tensor = offpolicy_mask_tensor.to(dtype=torch.bool)
 
         sequence_ids = torch.cat([input_ids, response_ids], dim=-1)
