@@ -1,6 +1,6 @@
 data:
   train_files: hiyouga/math12k@train
-  val_files: null
+  val_files: 
   prompt_key: problem
   answer_key: answer
   max_prompt_length: 512
