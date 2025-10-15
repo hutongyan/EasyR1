@@ -390,6 +390,8 @@ class RayPPOTrainer:
         self.logger.log_generation(samples, self.global_step)
 
     def _validate(self) -> dict[str, Any]:
+        if self.val_dataloader is None or self.val_reward_fn is None:
+            return {}
         reward_tensor_lst = []
         # Lists to collect samples for the table
         sample_inputs, sample_outputs, sample_labels, sample_scores = [], [], [], []
