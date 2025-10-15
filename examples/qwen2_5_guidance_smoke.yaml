@@ -1,6 +1,6 @@
 data:
   train_files: hiyouga/math12k@train
-  val_files: 
+  val_files: ''
   prompt_key: problem
   answer_key: answer
   max_prompt_length: 512
@@ -11,7 +11,6 @@ data:
   seed: 1
   filter_overlong_prompts: true
   filter_overlong_prompts_workers: 4
-
 worker:
   hybrid_engine: true
   actor:
@@ -28,8 +27,8 @@ worker:
       trust_remote_code: false
       enable_gradient_checkpointing: true
     optim:
-      lr: 1.0e-6
-      weight_decay: 1.0e-2
+      lr: 1.0e-06
+      weight_decay: 0.01
       strategy: adamw
       lr_warmup_ratio: 0.0
     fsdp:
@@ -52,8 +51,8 @@ worker:
       tokenizer_path: null
       trust_remote_code: true
     optim:
-      lr: 1.0e-6
-      weight_decay: 1.0e-2
+      lr: 1.0e-06
+      weight_decay: 0.01
       strategy: adamw
       lr_warmup_ratio: 0.0
     fsdp:
@@ -97,18 +96,17 @@ worker:
     reward_function: ./examples/reward_function/math.py:compute_score
     skip_special_tokens: true
     num_cpus: 1
-
 algorithm:
   adv_estimator: grpo
   disable_kl: true
   use_kl_loss: false
   importance_clamp_min: 0.1
   importance_clamp_max: 5.0
-
 trainer:
   project_name: easy_r1
   experiment_name: qwen2_5_guidance_smoke_1gpu
-  logger: [console]
+  logger:
+  - console
   nnodes: 1
   n_gpus_per_node: 1
   total_epochs: 1
