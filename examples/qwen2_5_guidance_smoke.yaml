@@ -73,7 +73,7 @@ worker:
     use_torch_compile: false
   rollout:
     name: vllm
-    n: 2
+    n: 1
     temperature: 1.0
     top_p: 0.95
     tensor_parallel_size: 1
