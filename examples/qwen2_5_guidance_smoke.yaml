@@ -1,0 +1,112 @@
+data:
+  train_files: hiyouga/math12k@train
+  val_files: hiyouga/math12k@test
+  prompt_key: problem
+  answer_key: answer
+  max_prompt_length: 512
+  max_response_length: 512
+  rollout_batch_size: 4
+  mini_rollout_batch_size: 4
+  shuffle: true
+  seed: 1
+  filter_overlong_prompts: true
+  filter_overlong_prompts_workers: 4
+
+worker:
+  hybrid_engine: true
+  actor:
+    global_batch_size: 4
+    micro_batch_size_per_device_for_update: 1
+    micro_batch_size_per_device_for_experience: 1
+    padding_free: true
+    dynamic_batching: true
+    ulysses_size: 1
+    use_torch_compile: false
+    model:
+      model_path: Qwen/Qwen2.5-0.5B-Instruct
+      tokenizer_path: Qwen/Qwen2.5-0.5B-Instruct
+      trust_remote_code: false
+      enable_gradient_checkpointing: true
+    optim:
+      lr: 1.0e-6
+      weight_decay: 1.0e-2
+      strategy: adamw
+      lr_warmup_ratio: 0.0
+    fsdp:
+      enable_full_shard: false
+      enable_cpu_offload: false
+      enable_rank0_init: true
+    offload:
+      offload_params: false
+      offload_optimizer: false
+  critic:
+    strategy: fsdp
+    global_batch_size: 4
+    micro_batch_size_per_device_for_update: 1
+    micro_batch_size_per_device_for_experience: 1
+    padding_free: false
+    dynamic_batching: true
+    ulysses_size: 1
+    model:
+      model_path: null
+      tokenizer_path: null
+      trust_remote_code: true
+    optim:
+      lr: 1.0e-6
+      weight_decay: 1.0e-2
+      strategy: adamw
+      lr_warmup_ratio: 0.0
+    fsdp:
+      enable_full_shard: false
+      enable_cpu_offload: false
+      enable_rank0_init: true
+    offload:
+      offload_params: false
+      offload_optimizer: false
+  ref:
+    fsdp:
+      enable_full_shard: false
+      enable_cpu_offload: true
+      enable_rank0_init: true
+    offload:
+      offload_params: false
+    use_torch_compile: false
+  rollout:
+    name: vllm
+    n: 2
+    temperature: 1.0
+    top_p: 0.95
+    tensor_parallel_size: 1
+    gpu_memory_utilization: 0.4
+    dtype: bf16
+    enforce_eager: true
+    enable_chunked_prefill: false
+    disable_tqdm: true
+    offpolicy_guidance:
+      enable: true
+      model_path: Qwen/Qwen2.5-1.5B-Instruct
+      tensor_parallel_size: 1
+      gpu_memory_utilization: 0.35
+      logprobs: 4
+
+algorithm:
+  adv_estimator: grpo
+  disable_kl: true
+  use_kl_loss: false
+  importance_clamp_min: 0.1
+  importance_clamp_max: 5.0
+
+trainer:
+  project_name: easy_r1
+  experiment_name: qwen2_5_guidance_smoke_1gpu
+  logger: [console]
+  nnodes: 1
+  n_gpus_per_node: 1
+  total_epochs: 1
+  max_steps: 1
+  val_before_train: false
+  val_freq: -1
+  val_only: false
+  save_freq: -1
+  save_model_only: true
+  save_checkpoint_path: null
