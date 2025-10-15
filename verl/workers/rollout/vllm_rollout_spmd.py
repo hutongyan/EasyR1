@@ -257,8 +257,6 @@ class vLLMRollout(BaseRollout):
                 **guidance_engine_kwargs,
             )
 
-            self.guidance_engine.sleep(level=1)
-
             guidance_sampling_kwargs = dict(sampling_kwargs)
             requested_logprobs = self.guidance_config.logprobs if self.guidance_config.logprobs is not None else 0
             guidance_sampling_kwargs["logprobs"] = max(1, requested_logprobs)
