@@ -179,6 +179,8 @@ class vLLMRollout(BaseRollout):
             if config.limit_images:
                 engine_kwargs["limit_mm_per_prompt"] = {"image": config.limit_images}
 
+        enable_sleep_mode = config.offpolicy_guidance is None or not config.offpolicy_guidance.is_enabled()
+
         self.inference_engine = LLM(
             model=model_path,
             skip_tokenizer_init=False,
@@ -195,12 +197,12 @@ class vLLMRollout(BaseRollout):
             enforce_eager=config.enforce_eager,
             disable_custom_all_reduce=True,
             enable_chunked_prefill=config.enable_chunked_prefill,
-            enable_sleep_mode=True,
+            enable_sleep_mode=enable_sleep_mode,
             **engine_kwargs,
         )
 
-        # Offload vllm model to reduce peak memory usage when no extra guidance engine is created
-        if config.offpolicy_guidance is None or not config.offpolicy_guidance.is_enabled():
+        # Offload vllm model to reduce peak memory usage when sleep mode is enabled
+        if enable_sleep_mode:
             self.inference_engine.sleep(level=1)
 
         sampling_kwargs = {
@@ -254,7 +256,7 @@ class vLLMRollout(BaseRollout):
                 enforce_eager=config.enforce_eager,
                 disable_custom_all_reduce=True,
                 enable_chunked_prefill=config.enable_chunked_prefill,
-                enable_sleep_mode=True,
+                enable_sleep_mode=False,
                 **guidance_engine_kwargs,
             )
 
