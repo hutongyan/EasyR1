@@ -1,6 +1,6 @@
 data:
   train_files: hiyouga/math12k@train
-  val_files: hiyouga/math12k@test
+  val_files: null
   prompt_key: problem
   answer_key: answer
   max_prompt_length: 512
@@ -88,6 +88,10 @@ worker:
       tensor_parallel_size: 1
       gpu_memory_utilization: 0.35
       logprobs: 4
+    val_override_config:
+      temperature: 0.6
+      top_p: 0.95
+      n: 2
   reward:
     reward_type: batch
     reward_function: ./examples/reward_function/math.py:compute_score
