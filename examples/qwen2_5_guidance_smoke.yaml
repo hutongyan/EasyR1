@@ -38,7 +38,7 @@ worker:
       enable_rank0_init: true
     offload:
       offload_params: false
-      offload_optimizer: false
+      offload_optimizer: true
   critic:
     strategy: fsdp
     global_batch_size: 4
@@ -109,6 +109,7 @@ trainer:
   n_gpus_per_node: 1
   total_epochs: 1
   max_steps: 1
+  critic_warmup: 2
   val_before_train: false
   val_freq: -1
   val_only: false
