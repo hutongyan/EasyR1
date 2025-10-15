@@ -199,8 +199,9 @@ class vLLMRollout(BaseRollout):
             **engine_kwargs,
         )
 
-        # Offload vllm model to reduce peak memory usage
-        self.inference_engine.sleep(level=1)
+        # Offload vllm model to reduce peak memory usage when no extra guidance engine is created
+        if config.offpolicy_guidance is None or not config.offpolicy_guidance.is_enabled():
+            self.inference_engine.sleep(level=1)
 
         sampling_kwargs = {
             "max_tokens": config.response_length,
