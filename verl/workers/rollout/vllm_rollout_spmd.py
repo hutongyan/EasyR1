@@ -352,6 +352,12 @@ class vLLMRollout(BaseRollout):
                     offpolicy_masks.append(offpolicy_mask)
                     guidance_logprob_list.append(guidance_logprobs)
 
+                expected = input_ids.size(0)
+                if len(response_list) != expected:
+                    raise RuntimeError(
+                        f"Guidance model returned {len(response_list)} sequences for a batch of {expected}."
+                    )
+
                 response_ids = VF.pad_2d_list_to_length(
                     response_list, self.pad_token_id, max_length=self.config.response_length
                 ).to(input_ids.device)
@@ -382,6 +388,10 @@ class vLLMRollout(BaseRollout):
                     guidance_logprob_tensor = _repeat_interleave(guidance_logprob_tensor, self.sampling_params.n)
 
         if offpolicy_mask_tensor is not None:
+            if offpolicy_mask_tensor.size(0) != batch_size:
+                repeat = batch_size // offpolicy_mask_tensor.size(0)
+                offpolicy_mask_tensor = offpolicy_mask_tensor.repeat_interleave(repeat, dim=0)
+                guidance_logprob_tensor = guidance_logprob_tensor.repeat_interleave(repeat, dim=0)
             offpolicy_mask_tensor = offpolicy_mask_tensor.to(dtype=torch.bool)
 
         sequence_ids = torch.cat([input_ids, response_ids], dim=-1)
