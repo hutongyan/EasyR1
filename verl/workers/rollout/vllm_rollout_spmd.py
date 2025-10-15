@@ -338,6 +338,18 @@ class vLLMRollout(BaseRollout):
                     use_tqdm=False,
                 )
                 guidance_outputs = [output for completion in guidance_completions for output in completion.outputs]
+                guidance_samplings = getattr(self.guidance_sampling_params, "n", 1)
+                if guidance_samplings > 1:
+                    if len(guidance_outputs) % guidance_samplings != 0:
+                        raise RuntimeError(
+                            "Guidance model returned an unexpected number of sequences "
+                            f"({len(guidance_outputs)}) for n={guidance_samplings}."
+                        )
+                    guidance_outputs = [
+                        guidance_outputs[idx]
+                        for idx in range(0, len(guidance_outputs), guidance_samplings)
+                    ]
+
                 if len(guidance_outputs) != len(draft_outputs):
                     raise RuntimeError(
                         "Guidance model returned a different number of sequences compared to the actor rollout."
