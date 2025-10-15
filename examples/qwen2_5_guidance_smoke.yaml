@@ -88,6 +88,11 @@ worker:
       tensor_parallel_size: 1
       gpu_memory_utilization: 0.35
       logprobs: 4
+  reward:
+    reward_type: batch
+    reward_function: ./examples/reward_function/math.py:compute_score
+    skip_special_tokens: true
+    num_cpus: 1
 
 algorithm:
   adv_estimator: grpo
