@@ -29,6 +29,7 @@ class OffPolicyGuidanceConfig:
     max_model_len: Optional[int] = None
     max_num_batched_tokens: Optional[int] = None
     logprobs: int = 1
+    num_speculative_tokens: Optional[int] = None
     sampling_overrides: dict[str, Any] = field(default_factory=dict)
 
     def is_enabled(self) -> bool:

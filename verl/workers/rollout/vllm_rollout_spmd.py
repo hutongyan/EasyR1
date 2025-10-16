@@ -147,6 +147,39 @@ def _merge_guidance_outputs(draft_output: Any, guidance_output: Any) -> tuple[li
     return guidance_tokens, offpolicy_mask, guidance_logprobs
 
 
+def _build_speculative_mask(token_ids: list[int], metrics: Any) -> list[int]:
+    mask: list[int] = []
+    idx = 0
+    counts = None
+    if metrics is not None:
+        counts = getattr(metrics, "spec_token_acceptance_counts", None)
+
+    if counts is None:
+        return [1] * len(token_ids)
+
+    total_tokens = len(token_ids)
+    for accepted in counts:
+        for _ in range(accepted):
+            if idx >= total_tokens:
+                return mask + [1] * (total_tokens - len(mask))
+            mask.append(0)
+            idx += 1
+
+        if idx >= total_tokens:
+            return mask
+
+        mask.append(1)
+        idx += 1
+
+        if idx >= total_tokens:
+            return mask
+
+    if idx < total_tokens:
+        mask.extend([1] * (total_tokens - idx))
+
+    return mask
+
+
 class vLLMRollout(BaseRollout):
     def __init__(
         self,
@@ -179,7 +212,35 @@ class vLLMRollout(BaseRollout):
             if config.limit_images:
                 engine_kwargs["limit_mm_per_prompt"] = {"image": config.limit_images}
 
-        enable_sleep_mode = config.offpolicy_guidance is None or not config.offpolicy_guidance.is_enabled()
+        self.guidance_config: Optional[OffPolicyGuidanceConfig] = (
+            config.offpolicy_guidance if config.offpolicy_guidance and config.offpolicy_guidance.is_enabled() else None
+        )
+
+        speculative_config = None
+        if self.guidance_config is not None:
+            guidance_tp = self.guidance_config.tensor_parallel_size or config.tensor_parallel_size
+            guidance_gpu_mem = self.guidance_config.gpu_memory_utilization or config.gpu_memory_utilization
+            guidance_max_model_len = self.guidance_config.max_model_len or (
+                config.max_model_len or config.prompt_length + config.response_length
+            )
+            guidance_max_batched_tokens = (
+                self.guidance_config.max_num_batched_tokens or config.max_num_batched_tokens
+            )
+            guidance_dtype = self.guidance_config.dtype or config.dtype
+            speculative_config = {
+                "model": self.guidance_config.model_path,
+                "tensor_parallel_size": guidance_tp,
+                "dtype": PrecisionType.to_str(PrecisionType.to_dtype(guidance_dtype)),
+                "gpu_memory_utilization": guidance_gpu_mem,
+                "max_model_len": guidance_max_model_len,
+                "max_num_batched_tokens": guidance_max_batched_tokens,
+                "num_speculative_tokens": self.guidance_config.num_speculative_tokens,
+            }
+            if self.guidance_config.sampling_overrides:
+                speculative_config.update(self.guidance_config.sampling_overrides)
+            enable_sleep_mode = False
+        else:
+            enable_sleep_mode = True
 
         self.inference_engine = LLM(
             model=model_path,
@@ -198,6 +259,7 @@ class vLLMRollout(BaseRollout):
             disable_custom_all_reduce=True,
             enable_chunked_prefill=config.enable_chunked_prefill,
             enable_sleep_mode=enable_sleep_mode,
+            speculative_config=speculative_config,
             **engine_kwargs,
         )
 
@@ -217,57 +279,7 @@ class vLLMRollout(BaseRollout):
         print(f"Sampling params: {sampling_kwargs}.")
         self.sampling_params = SamplingParams(**sampling_kwargs)
 
-        self.guidance_config: Optional[OffPolicyGuidanceConfig] = (
-            config.offpolicy_guidance if config.offpolicy_guidance and config.offpolicy_guidance.is_enabled() else None
-        )
-        self.guidance_engine: Optional[LLM] = None
         self.guidance_sampling_params: Optional[SamplingParams] = None
-
-        if self.guidance_config is not None:
-            guidance_engine_kwargs = {}
-            if processor is not None:
-                guidance_engine_kwargs["disable_mm_preprocessor_cache"] = True
-                if config.limit_images:
-                    guidance_engine_kwargs["limit_mm_per_prompt"] = {"image": config.limit_images}
-
-            guidance_tp = self.guidance_config.tensor_parallel_size or config.tensor_parallel_size
-            guidance_gpu_mem = self.guidance_config.gpu_memory_utilization or config.gpu_memory_utilization
-            guidance_max_model_len = self.guidance_config.max_model_len or (
-                config.max_model_len or config.prompt_length + config.response_length
-            )
-            guidance_max_batched_tokens = (
-                self.guidance_config.max_num_batched_tokens or config.max_num_batched_tokens
-            )
-
-            guidance_dtype = self.guidance_config.dtype or config.dtype
-            self.guidance_engine = LLM(
-                model=self.guidance_config.model_path,
-                skip_tokenizer_init=False,
-                trust_remote_code=config.trust_remote_code,
-                load_format="dummy",
-                dtype=PrecisionType.to_str(PrecisionType.to_dtype(guidance_dtype)),
-                seed=config.seed,
-                max_model_len=guidance_max_model_len,
-                distributed_executor_backend="external_launcher",
-                tensor_parallel_size=guidance_tp,
-                gpu_memory_utilization=guidance_gpu_mem,
-                max_num_batched_tokens=guidance_max_batched_tokens,
-                disable_log_stats=config.disable_log_stats,
-                enforce_eager=config.enforce_eager,
-                disable_custom_all_reduce=True,
-                enable_chunked_prefill=config.enable_chunked_prefill,
-                enable_sleep_mode=False,
-                **guidance_engine_kwargs,
-            )
-
-            guidance_sampling_kwargs = dict(sampling_kwargs)
-            requested_logprobs = self.guidance_config.logprobs if self.guidance_config.logprobs is not None else 0
-            guidance_sampling_kwargs["logprobs"] = max(1, requested_logprobs)
-            if self.guidance_config.sampling_overrides:
-                guidance_sampling_kwargs.update(self.guidance_config.sampling_overrides)
-
-            print(f"Guidance sampling params: {guidance_sampling_kwargs}.")
-            self.guidance_sampling_params = SamplingParams(**guidance_sampling_kwargs)
 
     @contextmanager
     def update_sampling_params(self, **kwargs):
@@ -304,100 +316,71 @@ class vLLMRollout(BaseRollout):
         non_tensor_batch = prompts.non_tensor_batch
         batch_raw_prompt_ids = non_tensor_batch.pop("raw_prompt_ids")
         batch_multi_modal_data = non_tensor_batch.pop("multi_modal_data", None)
+
+        target_n = int(prompts.meta_info.get("n", self.sampling_params.n))
+        if target_n < 1:
+            target_n = 1
+
+        if target_n > 1:
+            input_ids = _repeat_interleave(input_ids, target_n)
+            attention_mask = _repeat_interleave(attention_mask, target_n)
+            position_ids = _repeat_interleave(position_ids, target_n)
+            if batch_multi_modal_data is not None:
+                batch_multi_modal_data = _repeat_interleave(batch_multi_modal_data, target_n)
+            batch_raw_prompt_ids = [raw_prompt_id for raw_prompt_id in batch_raw_prompt_ids for _ in range(target_n)]
+            batch_size = input_ids.size(0)
         if batch_size != len(batch_raw_prompt_ids):
             raise RuntimeError("vllm sharding manager is not work properly.")
 
+        processed_mm: list[Optional[dict[str, Any]]] = []
         if batch_multi_modal_data is not None:
-            vllm_inputs = []
-            for raw_prompt_ids, multi_modal_data in zip(batch_raw_prompt_ids, batch_multi_modal_data):
-                vllm_inputs.append(
-                    {
-                        "prompt_token_ids": list(raw_prompt_ids),
-                        "multi_modal_data": _process_multi_modal_data(
-                            multi_modal_data,
-                            prompts.meta_info["min_pixels"],
-                            prompts.meta_info["max_pixels"],
-                            prompts.meta_info["video_fps"],
-                        ),
-                    }
+            for multi_modal_data in batch_multi_modal_data:
+                processed_mm.append(
+                    _process_multi_modal_data(
+                        multi_modal_data,
+                        prompts.meta_info["min_pixels"],
+                        prompts.meta_info["max_pixels"],
+                        prompts.meta_info["video_fps"],
+                    )
                 )
-        else:
-            vllm_inputs = [{"prompt_token_ids": list(raw_prompt_ids)} for raw_prompt_ids in batch_raw_prompt_ids]
+        if not processed_mm:
+            processed_mm = [None] * batch_size
 
-        # users can customize different sampling_params at different run
-        with self.update_sampling_params(**prompts.meta_info):
+        vllm_inputs = []
+        for raw_prompt_ids, mm_data in zip(batch_raw_prompt_ids, processed_mm):
+            entry = {"prompt_token_ids": list(raw_prompt_ids)}
+            if mm_data is not None:
+                entry["multi_modal_data"] = mm_data
+            vllm_inputs.append(entry)
+
+        with self.update_sampling_params(**prompts.meta_info, n=1):
             completions: list[RequestOutput] = self.inference_engine.generate(
                 prompts=vllm_inputs, sampling_params=self.sampling_params, use_tqdm=self.use_tqdm
             )
 
-            draft_outputs: list = []
-            guidance_outputs: list | None = None
-            if self.guidance_engine is not None and self.guidance_sampling_params is not None:
-                guidance_completions: list[RequestOutput] = self.guidance_engine.generate(
-                    prompts=vllm_inputs,
-                    sampling_params=self.guidance_sampling_params,
-                    use_tqdm=False,
-                )
-                if len(guidance_completions) != len(completions):
-                    raise RuntimeError(
-                        "Guidance model returned a different number of completion groups compared to the actor rollout."
-                    )
-                guidance_outputs = []
+        response_sequences: list[list[int]] = []
+        offpolicy_masks: list[list[int]] = []
+        for completion in completions:
+            metrics = getattr(completion, "metrics", None)
+            for output in completion.outputs:
+                tokens = list(output.token_ids)
+                response_sequences.append(tokens)
+                offpolicy_masks.append(_build_speculative_mask(tokens, metrics))
 
-            for draft_completion_idx, draft_completion in enumerate(completions):
-                draft_group = draft_completion.outputs
-                draft_outputs.extend(draft_group)
-
-                if guidance_outputs is not None:
-                    guidance_group = guidance_completions[draft_completion_idx].outputs
-                    if len(guidance_group) != len(draft_group):
-                        raise RuntimeError(
-                            "Guidance model returned a different number of sequences per prompt compared to the actor rollout."
-                        )
-                    guidance_outputs.extend(guidance_group)
-
-            if guidance_outputs is not None:
-                response_list, offpolicy_masks, guidance_logprob_list = [], [], []
-                for draft_output, guidance_output in zip(draft_outputs, guidance_outputs):
-                    guidance_tokens, offpolicy_mask, guidance_logprobs = _merge_guidance_outputs(
-                        draft_output, guidance_output
-                    )
-                    response_list.append(guidance_tokens)
-                    offpolicy_masks.append(offpolicy_mask)
-                    guidance_logprob_list.append(guidance_logprobs)
-
-                response_ids = VF.pad_2d_list_to_length(
-                    response_list, self.pad_token_id, max_length=self.config.response_length
-                ).to(input_ids.device)
-                offpolicy_mask_tensor = VF.pad_2d_list_to_length(
-                    offpolicy_masks, 0, max_length=self.config.response_length
-                ).to(input_ids.device)
-                guidance_logprob_tensor = VF.pad_2d_list_to_length(
-                    guidance_logprob_list, 0.0, max_length=self.config.response_length
-                ).to(input_ids.device)
-                guidance_logprob_tensor = guidance_logprob_tensor.to(dtype=torch.float32)
-            else:
-                response_list = [output.token_ids for output in draft_outputs]
-                response_ids = VF.pad_2d_list_to_length(
-                    response_list, self.pad_token_id, max_length=self.config.response_length
-                ).to(input_ids.device)
-                offpolicy_mask_tensor = None
-                guidance_logprob_tensor = None
-
-        if self.sampling_params.n > 1:
-            new_batch_size = batch_size * self.sampling_params.n
-            batch_size = new_batch_size
-            input_ids = _repeat_interleave(input_ids, self.sampling_params.n)
-            attention_mask = _repeat_interleave(attention_mask, self.sampling_params.n)
-            position_ids = _repeat_interleave(position_ids, self.sampling_params.n)
-            if batch_multi_modal_data is not None:
-                batch_multi_modal_data = _repeat_interleave(batch_multi_modal_data, self.sampling_params.n)
-            if offpolicy_mask_tensor is not None and offpolicy_mask_tensor.size(0) != new_batch_size:
-                offpolicy_mask_tensor = _repeat_interleave(offpolicy_mask_tensor, self.sampling_params.n)
-                guidance_logprob_tensor = _repeat_interleave(guidance_logprob_tensor, self.sampling_params.n)
-
-        if offpolicy_mask_tensor is not None:
-            offpolicy_mask_tensor = offpolicy_mask_tensor.to(dtype=torch.bool)
+        response_ids = VF.pad_2d_list_to_length(
+            response_sequences, self.pad_token_id, max_length=self.config.response_length
+        ).to(input_ids.device)
+        offpolicy_mask_tensor = VF.pad_2d_list_to_length(
+            offpolicy_masks, 1, max_length=self.config.response_length
+        ).to(input_ids.device)
+        guidance_logprob_tensor = torch.full(
+            response_ids.shape,
+            float("nan"),
+            dtype=torch.float32,
+            device=response_ids.device,
+        )
+        offpolicy_mask_tensor = offpolicy_mask_tensor.to(dtype=torch.bool)
+        batch_size = response_ids.size(0)
 
         sequence_ids = torch.cat([input_ids, response_ids], dim=-1)
         response_length = response_ids.size(1)
