@@ -120,18 +120,25 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         assert self.loaded is False, "vllm engine has already been loaded"
         self.loaded = True
 
-        print_gpu_memory_usage("Before vllm wake up in sharding manager")
-        if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
-            self.inference_engine.wake_up(tags=["weights"])
+        enable_sleep_mode = getattr(
+            self.inference_engine.llm_engine.vllm_config.model_config, "enable_sleep_mode", False
+        )
+
+        if enable_sleep_mode:
+            print_gpu_memory_usage("Before vllm wake up in sharding manager")
+            if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
+                self.inference_engine.wake_up(tags=["weights"])
+            else:
+                self.inference_engine.wake_up()
+
+            self._sync_weight_to_vllm()
+
+            if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
+                self.inference_engine.wake_up(tags=["kv_cache"])
+
+            print_gpu_memory_usage("After vllm wake up in sharding manager")
         else:
-            self.inference_engine.wake_up()
-
-        self._sync_weight_to_vllm()
-
-        if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
-            self.inference_engine.wake_up(tags=["kv_cache"])
-
-        print_gpu_memory_usage("After vllm wake up in sharding manager")
+            self._sync_weight_to_vllm()
         # important: need to manually set the random states of each tp to be identical.
         if self.device_mesh is not None:
             self.torch_random_states = torch.cuda.get_rng_state()
@@ -142,12 +149,19 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         assert self.loaded is True, "vllm engine has not been loaded"
         self.loaded = False
 
-        print_gpu_memory_usage("Before vllm offload in sharding manager")
-        free_bytes_before_sleep = torch.cuda.mem_get_info()[0]
-        self.inference_engine.sleep(level=1)
-        free_bytes_after_sleep = torch.cuda.mem_get_info()[0]
-        self.freed_bytes = free_bytes_after_sleep - free_bytes_before_sleep
-        print_gpu_memory_usage("After vllm offload in sharding manager")
+        enable_sleep_mode = getattr(
+            self.inference_engine.llm_engine.vllm_config.model_config, "enable_sleep_mode", False
+        )
+
+        if enable_sleep_mode:
+            print_gpu_memory_usage("Before vllm offload in sharding manager")
+            free_bytes_before_sleep = torch.cuda.mem_get_info()[0]
+            self.inference_engine.sleep(level=1)
+            free_bytes_after_sleep = torch.cuda.mem_get_info()[0]
+            self.freed_bytes = free_bytes_after_sleep - free_bytes_before_sleep
+            print_gpu_memory_usage("After vllm offload in sharding manager")
+        else:
+            self.freed_bytes = 0
 
         self.module.train()
         torch.cuda.empty_cache()  # add empty cache after each compute
