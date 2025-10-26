@@ -335,8 +335,15 @@ class FSDPWorker(Worker):
             raise ValueError(f"rollout world size {self.world_size} is not divisible by tp size {tp_size}.")
 
         rollout_device_mesh = init_device_mesh("cuda", mesh_shape=(dp_size, tp_size), mesh_dim_names=("dp", "tp"))
+        if self.config.rollout.offpolicy_guidance and self.config.rollout.offpolicy_guidance.is_enabled():
+            rollout_model_path = self.config.rollout.offpolicy_guidance.model_path
+            sync_weights = False
+        else:
+            rollout_model_path = self.config.actor.model.model_path
+            sync_weights = True
+
         self.rollout = vLLMRollout(
-            model_path=self.config.actor.model.model_path,
+            model_path=rollout_model_path,
             config=self.config.rollout,
             tokenizer=self.tokenizer,
             processor=self.processor,
@@ -346,6 +353,7 @@ class FSDPWorker(Worker):
             inference_engine=self.rollout.inference_engine,
             device_mesh=rollout_device_mesh,
             use_param_offload=self._use_param_offload,
+            sync_weights=sync_weights,
         )
         print_gpu_memory_usage("After vllm init")
 

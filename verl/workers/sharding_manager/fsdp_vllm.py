@@ -39,12 +39,14 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         inference_engine: LLM,
         device_mesh: DeviceMesh,
         use_param_offload: bool,
+        sync_weights: bool = True,
     ):
         self.module = module
         self.inference_engine = inference_engine
         self.device_mesh = device_mesh
         self.use_param_offload = use_param_offload
         self.loaded = False
+        self.sync_weights = sync_weights
 
         self.world_size = dist.get_world_size()
         self.tp_size = vllm_ps.get_tensor_model_parallel_world_size()
@@ -90,6 +92,9 @@ class FSDPVLLMShardingManager(BaseShardingManager):
             yield name, tensor.full_tensor() if self.world_size != 1 else tensor
 
     def _sync_weight_to_vllm(self):
+        if not self.sync_weights:
+            return
+
         if self.use_param_offload:
             load_fsdp_model(self.module)
 
