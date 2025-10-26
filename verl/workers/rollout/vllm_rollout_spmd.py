@@ -273,7 +273,7 @@ class vLLMRollout(BaseRollout):
         batch_raw_prompt_ids = non_tensor_batch.pop("raw_prompt_ids")
         batch_multi_modal_data = non_tensor_batch.pop("multi_modal_data", None)
 
-        target_n = int(prompts.meta_info.get("n", self.sampling_params.n))
+        target_n = max(1, getattr(self.config, "n", 1))
         if target_n < 1:
             target_n = 1
 

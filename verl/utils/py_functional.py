@@ -24,7 +24,26 @@ from typing import Any, Union
 
 import numpy as np
 import yaml
-from codetiming import Timer
+import time
+
+try:
+    from codetiming import Timer
+except ModuleNotFoundError:
+    class Timer:  # minimal fallback while codetiming is unavailable
+        def __init__(self, name: str = "timer", logger=None):
+            self.name = name
+            self.logger = logger
+            self.start_time = None
+            self.last = 0.0
+
+        def __enter__(self):
+            self.start_time = time.perf_counter()
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            self.last = time.perf_counter() - self.start_time
+            if self.logger is not None:
+                self.logger.info(f"{self.name}: {self.last:.6f}s")
 from packaging import version
 from yaml import Dumper
 
