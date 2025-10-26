@@ -24,7 +24,7 @@ llm = LLM(
     model="Qwen/Qwen3-8B",
     tensor_parallel_size=2,
     gpu_memory_utilization=0.85,
-    speculative_config={
+    speculative_config=
         "model": "Qwen/Qwen3-1.7B",
         "num_speculative_tokens": 8, # K
     },

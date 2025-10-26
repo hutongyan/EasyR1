@@ -147,39 +147,6 @@ def _merge_guidance_outputs(draft_output: Any, guidance_output: Any) -> tuple[li
     return guidance_tokens, offpolicy_mask, guidance_logprobs
 
 
-def _build_speculative_mask(token_ids: list[int], metrics: Any) -> list[int]:
-    mask: list[int] = []
-    idx = 0
-    counts = None
-    if metrics is not None:
-        counts = getattr(metrics, "spec_token_acceptance_counts", None)
-
-    if counts is None:
-        return [1] * len(token_ids)
-
-    total_tokens = len(token_ids)
-    for accepted in counts:
-        for _ in range(accepted):
-            if idx >= total_tokens:
-                return mask + [1] * (total_tokens - len(mask))
-            mask.append(0)
-            idx += 1
-
-        if idx >= total_tokens:
-            return mask
-
-        mask.append(1)
-        idx += 1
-
-        if idx >= total_tokens:
-            return mask
-
-    if idx < total_tokens:
-        mask.extend([1] * (total_tokens - idx))
-
-    return mask
-
-
 class vLLMRollout(BaseRollout):
     def __init__(
         self,
@@ -218,24 +185,11 @@ class vLLMRollout(BaseRollout):
 
         speculative_config = None
         if self.guidance_config is not None:
-            guidance_tp = self.guidance_config.tensor_parallel_size or config.tensor_parallel_size
-            guidance_gpu_mem = self.guidance_config.gpu_memory_utilization or config.gpu_memory_utilization
-            guidance_max_model_len = self.guidance_config.max_model_len or (
-                config.max_model_len or config.prompt_length + config.response_length
-            )
-            guidance_max_batched_tokens = (
-                self.guidance_config.max_num_batched_tokens or config.max_num_batched_tokens
-            )
-            guidance_dtype = self.guidance_config.dtype or config.dtype
-            speculative_config = {
-                "model": self.guidance_config.model_path,
-                "tensor_parallel_size": guidance_tp,
-                "dtype": PrecisionType.to_str(PrecisionType.to_dtype(guidance_dtype)),
-                "gpu_memory_utilization": guidance_gpu_mem,
-                "max_model_len": guidance_max_model_len,
-                "max_num_batched_tokens": guidance_max_batched_tokens,
-                "num_speculative_tokens": self.guidance_config.num_speculative_tokens,
-            }
+            speculative_config = {"model": self.guidance_config.model_path}
+            if self.guidance_config.tensor_parallel_size is not None:
+                speculative_config["tensor_parallel_size"] = self.guidance_config.tensor_parallel_size
+            if self.guidance_config.num_speculative_tokens is not None:
+                speculative_config["num_speculative_tokens"] = self.guidance_config.num_speculative_tokens
             if self.guidance_config.sampling_overrides:
                 speculative_config.update(self.guidance_config.sampling_overrides)
             enable_sleep_mode = False
@@ -276,6 +230,7 @@ class vLLMRollout(BaseRollout):
         for key in config.to_dict().keys():
             if hasattr(default_sampling_params, key):
                 sampling_kwargs[key] = getattr(config, key)
+        sampling_kwargs["logprobs"] = max(1, sampling_kwargs.get("logprobs", 0))
         print(f"Sampling params: {sampling_kwargs}.")
         self.sampling_params = SamplingParams(**sampling_kwargs)
 
@@ -353,33 +308,33 @@ class vLLMRollout(BaseRollout):
                 entry["multi_modal_data"] = mm_data
             vllm_inputs.append(entry)
 
-        with self.update_sampling_params(**prompts.meta_info, n=1):
+        with self.update_sampling_params(**prompts.meta_info):
             completions: list[RequestOutput] = self.inference_engine.generate(
                 prompts=vllm_inputs, sampling_params=self.sampling_params, use_tqdm=self.use_tqdm
             )
 
         response_sequences: list[list[int]] = []
         offpolicy_masks: list[list[int]] = []
+        guidance_logprob_list: list[list[float]] = []
+        spec_metrics: list[Any] = []
+
         for completion in completions:
             metrics = getattr(completion, "metrics", None)
             for output in completion.outputs:
                 tokens = list(output.token_ids)
                 response_sequences.append(tokens)
-                offpolicy_masks.append(_build_speculative_mask(tokens, metrics))
+                offpolicy_masks.append([1] * len(tokens))  # treat all tokens as off-policy
+                guidance_logprob_list.append(_extract_sequence_logprobs(output))
+                spec_metrics.append(metrics)
 
         response_ids = VF.pad_2d_list_to_length(
             response_sequences, self.pad_token_id, max_length=self.config.response_length
         ).to(input_ids.device)
-        offpolicy_mask_tensor = VF.pad_2d_list_to_length(
-            offpolicy_masks, 1, max_length=self.config.response_length
+        offpolicy_mask_tensor = torch.ones_like(response_ids, dtype=torch.bool)
+        guidance_logprob_tensor = VF.pad_2d_list_to_length(
+            guidance_logprob_list, float("nan"), max_length=self.config.response_length
         ).to(input_ids.device)
-        guidance_logprob_tensor = torch.full(
-            response_ids.shape,
-            float("nan"),
-            dtype=torch.float32,
-            device=response_ids.device,
-        )
-        offpolicy_mask_tensor = offpolicy_mask_tensor.to(dtype=torch.bool)
+        guidance_logprob_tensor = guidance_logprob_tensor.to(dtype=torch.float32)
         batch_size = response_ids.size(0)
 
         sequence_ids = torch.cat([input_ids, response_ids], dim=-1)
@@ -418,5 +373,7 @@ class vLLMRollout(BaseRollout):
             non_tensor_batch = {"multi_modal_data": batch_multi_modal_data}
         else:
             non_tensor_batch = {}
+        if spec_metrics:
+            non_tensor_batch["speculative_metrics"] = np.array(spec_metrics, dtype=object)
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info=prompts.meta_info)
