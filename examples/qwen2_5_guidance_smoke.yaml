@@ -72,7 +72,7 @@ worker:
     use_torch_compile: false
   rollout:
     name: vllm
-    n: 2
+    n: 1
     temperature: 1.0
     top_p: 0.95
     tensor_parallel_size: 1
@@ -91,7 +91,7 @@ worker:
     val_override_config:
       temperature: 0.6
       top_p: 0.95
-      n: 2
+      n: 1
   reward:
     reward_type: batch
     reward_function: ./examples/reward_function/math.py:compute_score
