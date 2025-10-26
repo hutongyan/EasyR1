@@ -230,6 +230,7 @@ class vLLMRollout(BaseRollout):
         for key in config.to_dict().keys():
             if hasattr(default_sampling_params, key):
                 sampling_kwargs[key] = getattr(config, key)
+        sampling_kwargs["n"] = 1
         sampling_kwargs["logprobs"] = max(1, sampling_kwargs.get("logprobs", 0))
         print(f"Sampling params: {sampling_kwargs}.")
         self.sampling_params = SamplingParams(**sampling_kwargs)
